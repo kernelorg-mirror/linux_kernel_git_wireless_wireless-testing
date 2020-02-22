@@ -157,6 +157,7 @@ struct ice_priv_flag {
 static const struct ice_priv_flag ice_gstrings_priv_flags[] = {
 	ICE_PRIV_FLAG("link-down-on-close", ICE_FLAG_LINK_DOWN_ON_CLOSE_ENA),
 	ICE_PRIV_FLAG("fw-lldp-agent", ICE_FLAG_FW_LLDP_AGENT),
+	ICE_PRIV_FLAG("mdd-auto-reset-vf", ICE_FLAG_MDD_AUTO_RESET_VF),
 	ICE_PRIV_FLAG("legacy-rx", ICE_FLAG_LEGACY_RX),
 };
 
@@ -462,7 +463,7 @@ static int ice_lbtest_prepare_rings(struct ice_vsi *vsi)
 	if (status)
 		goto err_setup_rx_ring;
 
-	status = ice_vsi_start_rx_rings(vsi);
+	status = ice_vsi_start_all_rx_rings(vsi);
 	if (status)
 		goto err_start_rx_ring;
 
@@ -494,7 +495,7 @@ static int ice_lbtest_disable_rings(struct ice_vsi *vsi)
 		netdev_err(vsi->netdev, "Failed to stop Tx rings, VSI %d error %d\n",
 			   vsi->vsi_num, status);
 
-	status = ice_vsi_stop_rx_rings(vsi);
+	status = ice_vsi_stop_all_rx_rings(vsi);
 	if (status)
 		netdev_err(vsi->netdev, "Failed to stop Rx rings, VSI %d error %d\n",
 			   vsi->vsi_num, status);
@@ -672,7 +673,7 @@ static u64 ice_loopback_test(struct net_device *netdev)
 
 	test_vsi = ice_lb_vsi_setup(pf, pf->hw.port_info);
 	if (!test_vsi) {
-		netdev_err(netdev, "Failed to create a VSI for the loopback test");
+		netdev_err(netdev, "Failed to create a VSI for the loopback test\n");
 		return 1;
 	}
 
@@ -731,7 +732,7 @@ lbtest_free_frame:
 	devm_kfree(dev, tx_frame);
 remove_mac_filters:
 	if (ice_remove_mac(&pf->hw, &tmp_list))
-		netdev_err(netdev, "Could not remove MAC filter for the test VSI");
+		netdev_err(netdev, "Could not remove MAC filter for the test VSI\n");
 free_mac_list:
 	ice_free_fltr_list(dev, &tmp_list);
 lbtest_mac_dis:
@@ -744,7 +745,7 @@ lbtest_rings_dis:
 lbtest_vsi_close:
 	test_vsi->netdev = NULL;
 	if (ice_vsi_release(test_vsi))
-		netdev_err(netdev, "Failed to remove the test VSI");
+		netdev_err(netdev, "Failed to remove the test VSI\n");
 
 	return ret;
 }
@@ -834,7 +835,7 @@ ice_self_test(struct net_device *netdev, struct ethtool_test *eth_test,
 			int status = ice_open(netdev);
 
 			if (status) {
-				dev_err(dev, "Could not open device %s, err %d",
+				dev_err(dev, "Could not open device %s, err %d\n",
 					pf->int_name, status);
 			}
 		}
@@ -1091,7 +1092,6 @@ ice_get_fecparam(struct net_device *netdev, struct ethtool_fecparam *fecparam)
 		fecparam->active_fec = ETHTOOL_FEC_BASER;
 		break;
 	case ICE_AQ_LINK_25G_RS_528_FEC_EN:
-		/* fall through */
 	case ICE_AQ_LINK_25G_RS_544_FEC_EN:
 		fecparam->active_fec = ETHTOOL_FEC_RS;
 		break;
@@ -1781,7 +1781,6 @@ ice_get_settings_link_up(struct ethtool_link_ksettings *ks,
 						     Asym_Pause);
 		break;
 	case ICE_FC_PFC:
-		/* fall through */
 	default:
 		ethtool_link_ksettings_del_link_mode(ks, lp_advertising, Pause);
 		ethtool_link_ksettings_del_link_mode(ks, lp_advertising,
@@ -2936,13 +2935,6 @@ ice_set_pauseparam(struct net_device *netdev, struct ethtool_pauseparam *pause)
 	else
 		return -EINVAL;
 
-	/* Tell the OS link is going down, the link will go back up when fw
-	 * says it is ready asynchronously
-	 */
-	ice_print_link_msg(vsi, false);
-	netif_carrier_off(netdev);
-	netif_tx_stop_all_queues(netdev);
-
 	/* Set the FC mode and only restart AN if link is up */
 	status = ice_set_fc(pi, &aq_failures, link_up);
 
@@ -3489,21 +3481,13 @@ ice_set_rc_coalesce(enum ice_container_type c_type, struct ethtool_coalesce *ec,
 		return -EINVAL;
 	}
 
-	/* hardware only supports an ITR granularity of 2us */
-	if (coalesce_usecs % 2 != 0) {
-		netdev_info(vsi->netdev, "Invalid value, %s-usecs must be even\n",
-			    c_type_str);
-		return -EINVAL;
-	}
-
 	if (use_adaptive_coalesce) {
 		rc->itr_setting |= ICE_ITR_DYNAMIC;
 	} else {
-		/* store user facing value how it was set */
+		/* save the user set usecs */
 		rc->itr_setting = coalesce_usecs;
-		/* set to static and convert to value HW understands */
-		rc->target_itr =
-			ITR_TO_REG(ITR_REG_ALIGN(rc->itr_setting));
+		/* device ITR granularity is in 2 usec increments */
+		rc->target_itr = ITR_REG_ALIGN(rc->itr_setting);
 	}
 
 	return 0;
@@ -3597,6 +3581,30 @@ ice_is_coalesce_param_invalid(struct net_device *netdev,
 }
 
 /**
+ * ice_print_if_odd_usecs - print message if user tries to set odd [tx|rx]-usecs
+ * @netdev: netdev used for print
+ * @itr_setting: previous user setting
+ * @use_adaptive_coalesce: if adaptive coalesce is enabled or being enabled
+ * @coalesce_usecs: requested value of [tx|rx]-usecs
+ * @c_type_str: either "rx" or "tx" to match user set field of [tx|rx]-usecs
+ */
+static void
+ice_print_if_odd_usecs(struct net_device *netdev, u16 itr_setting,
+		       u32 use_adaptive_coalesce, u32 coalesce_usecs,
+		       const char *c_type_str)
+{
+	if (use_adaptive_coalesce)
+		return;
+
+	itr_setting = ITR_TO_REG(itr_setting);
+
+	if (itr_setting != coalesce_usecs && (coalesce_usecs % 2))
+		netdev_info(netdev, "User set %s-usecs to %d, device only supports even values. Rounding down and attempting to set %s-usecs to %d\n",
+			    c_type_str, coalesce_usecs, c_type_str,
+			    ITR_REG_ALIGN(coalesce_usecs));
+}
+
+/**
  * __ice_set_coalesce - set ITR/INTRL values for the device
  * @netdev: pointer to the netdev associated with this query
  * @ec: ethtool structure to fill with driver's coalesce settings
@@ -3616,7 +3624,18 @@ __ice_set_coalesce(struct net_device *netdev, struct ethtool_coalesce *ec,
 		return -EINVAL;
 
 	if (q_num < 0) {
+		struct ice_q_vector *q_vector = vsi->q_vectors[0];
 		int v_idx;
+
+		if (q_vector) {
+			ice_print_if_odd_usecs(netdev, q_vector->rx.itr_setting,
+					       ec->use_adaptive_rx_coalesce,
+					       ec->rx_coalesce_usecs, "rx");
+
+			ice_print_if_odd_usecs(netdev, q_vector->tx.itr_setting,
+					       ec->use_adaptive_tx_coalesce,
+					       ec->tx_coalesce_usecs, "tx");
+		}
 
 		ice_for_each_q_vector(vsi, v_idx) {
 			/* In some cases if DCB is configured the num_[rx|tx]q
